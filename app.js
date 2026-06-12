@@ -5,8 +5,9 @@
 
 // Broker Configurations with WebSockets SSL ports
 const BROKERS = [
-    { name: "HiveMQ Cloud", url: "wss://broker.hivemq.com:8884/mqtt" },
-    { name: "EMQX Cloud", url: "wss://broker.emqx.io:8084/mqtt" },
+    { name: "Eclipse Projects", url: "wss://mqtt.eclipseprojects.io:443/mqtt" },
+    { name: "HiveMQ Public", url: "wss://broker.hivemq.com:8884/mqtt" },
+    { name: "EMQX Public", url: "wss://broker.emqx.io:8084/mqtt" },
     { name: "Mosquitto Public", url: "wss://test.mosquitto.org:8081/mqtt" }
 ];
 
@@ -27,6 +28,7 @@ let state = {
     theme: 'dark',
     mode: 'dashboard', // 'dashboard', 'sharing', 'viewer'
     usingHighAccuracy: true, // track accuracy preference
+    connectionAttempts: 0, // track consecutive connection failures
     // Sharer specific state
     activeShare: null, // { cID, key, name, exp, duration }
     watchId: null,
@@ -666,6 +668,7 @@ function connectMqttClient(onConnectCallback) {
         state.mqttClient.on('connect', () => {
             clearTimeout(fallbackTimeout);
             state.isConnectingMqtt = false;
+            state.connectionAttempts = 0; // Reset counter on success
             console.log(`Connected to broker: ${broker.name}`);
             
             if (state.mode === 'sharing') {
@@ -712,6 +715,11 @@ function handleMqttConnectionFallback(onConnectCallback) {
     state.currentBrokerIndex = (state.currentBrokerIndex + 1) % BROKERS.length;
     const nextBroker = BROKERS[state.currentBrokerIndex];
     console.log(`Switching sync node to: ${nextBroker.name}`);
+    
+    state.connectionAttempts = (state.connectionAttempts || 0) + 1;
+    if (state.connectionAttempts >= BROKERS.length) {
+        showToast("Slow connection. If using Brave or an AdBlocker, try pausing Shields.", "warning");
+    }
     
     if (state.mode === 'sharing') {
         updateMqttStatus("connecting", `Trying network node ${state.currentBrokerIndex + 1}...`);
