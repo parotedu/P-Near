@@ -1,9 +1,14 @@
 /**
  * P-Near: Serverless Real-Time Location Sharing Platform
- * Client-side core logic and MQTT/Leaflet integration.
+ * Client-side core logic with HTTP GET/POST Polling and Hex Encryption.
  */
 
-const SYNC_SERVER = "https://ntfy.sh";
+// Optional: Paste your own Google Apps Script Web App URL for 100% private, unlimited sync.
+// Leave empty to use the default free public key-value store (zero-signup).
+const PRIVATE_SYNC_URL = "";
+
+// Default Public Sync Server
+const PUBLIC_SYNC_SERVER = "https://keyvalue.immanuel.co/api/KeyVal";
 
 // Map Configurations
 const MAP_THEMES = {
@@ -23,31 +28,32 @@ let state = {
     mode: 'dashboard', // 'dashboard', 'sharing', 'viewer'
     usingHighAccuracy: true, // track accuracy preference
     // Sharer specific state
-    activeShare: null, // { cID, key, name, exp, duration }
+    activeShare: null, // { cID, key, name, exp, duration, appKey }
     watchId: null,
     wakeLock: null,
     packetCount: 0,
     lastPublishedCoords: null,
+    publishIntervalId: null,
     // Viewer specific state
     viewer: {
         cID: null,
         key: null,
+        appKey: null,
         sharerName: "Someone",
         exp: null,
         coords: null,
         history: [], // Array of [lat, lng] for breadcrumbs
         lastPingTime: null,
         myWatchId: null,
-        myCoords: null
+        myCoords: null,
+        pollIntervalId: null
     },
     // Leaflet map objects
     map: null,
     tileLayer: null,
     sharerMarker: null,
     viewerMarker: null, // Viewer's own location marker
-    breadcrumbsPolyline: null,
-    // Sync stream connection state
-    eventSource: null
+    breadcrumbsPolyline: null
 };
 
 // DOM Elements
@@ -119,12 +125,14 @@ document.addEventListener('DOMContentLoaded', () => {
 function routeApp() {
     const urlParams = new URLSearchParams(window.location.search);
     const shareCID = urlParams.get('share');
+    const appKey = urlParams.get('app');
     const hashKey = window.location.hash ? window.location.hash.substring(1) : null;
     
     if (shareCID && hashKey) {
         // Mode: Viewer
         state.mode = 'viewer';
         state.viewer.cID = shareCID;
+        state.viewer.appKey = appKey; // Null if using private sync
         state.viewer.key = hashKey;
         
         switchView('viewer');
@@ -146,7 +154,12 @@ function routeApp() {
                 initMap();
                 
                 // Set sharing URL in inputs
-                const shareUrl = `${window.location.origin}${window.location.pathname}?share=${parsed.cID}#${parsed.key}`;
+                let shareUrl = `${window.location.origin}${window.location.pathname}?share=${parsed.cID}`;
+                if (parsed.appKey) {
+                    shareUrl += `&app=${parsed.appKey}`;
+                }
+                shareUrl += `#${parsed.key}`;
+                
                 el.shareUrlInput.value = shareUrl;
                 
                 // Initialize background components
@@ -316,16 +329,17 @@ function updateCountdownTimers() {
             el.viewerPulse.className = "pulse-dot red";
             showToast("This location sharing session has expired.", "warning");
             
-            // Clean viewer subscriptions
-            if (state.mqttClient) {
-                state.mqttClient.end();
+            // Clean viewer polling
+            if (state.viewer.pollIntervalId) {
+                clearInterval(state.viewer.pollIntervalId);
+                state.viewer.pollIntervalId = null;
             }
         } else {
             el.viewerTimer.innerText = formatCountdown(remaining);
             
-            // If it's been more than 25 seconds since the last update, mark user as offline/paused
-            if (state.viewer.lastPingTime && (now - state.viewer.lastPingTime > 25000)) {
-                el.viewerStatusText.innerText = "Paused / Weak Signal";
+            // If it's been more than 20 seconds since the last successful read, mark offline/paused
+            if (state.viewer.lastPingTime && (now - state.viewer.lastPingTime > 20000)) {
+                el.viewerStatusText.innerText = "Offline / Connection Weak";
                 el.viewerPulse.className = "pulse-dot red";
             }
         }
@@ -342,33 +356,57 @@ function handleStartShare() {
     const activeDurationBtn = document.querySelector('.duration-btn.active');
     const minutes = parseInt(activeDurationBtn.getAttribute('data-minutes'), 10);
     
-    // Check permission first
+    // Check permission capability first
     if (!navigator.geolocation) {
         showToast("Geolocation is not supported by your browser.", "error");
         return;
     }
     
-    // Generate sharing credentials instantly
     const cID = "pnear_" + generateRandomId(16);
     const key = generateRandomId(24); // Crypto key
     const exp = Date.now() + (minutes * 60 * 1000);
     
-    state.activeShare = { cID, key, name: sharerName, exp, duration: minutes };
-    localStorage.setItem('pnear-active-share', JSON.stringify(state.activeShare));
-    
-    // Set URL
-    const shareUrl = `${window.location.origin}${window.location.pathname}?share=${cID}#${key}`;
-    el.shareUrlInput.value = shareUrl;
-    
-    // Switch screen to sharing view
-    state.mode = 'sharing';
-    switchView('sharing');
-    initMap();
-    
-    // Start components (MQTT, Wakelock, Location Watch)
-    startLocationSharing();
-    
-    showToast("Sharing session created! Acquiring location...", "info");
+    // If using private sync, setup instantly
+    if (PRIVATE_SYNC_URL) {
+        state.activeShare = { cID, key, name: sharerName, exp, duration: minutes, appKey: null };
+        localStorage.setItem('pnear-active-share', JSON.stringify(state.activeShare));
+        
+        const shareUrl = `${window.location.origin}${window.location.pathname}?share=${cID}#${key}`;
+        el.shareUrlInput.value = shareUrl;
+        
+        state.mode = 'sharing';
+        switchView('sharing');
+        initMap();
+        startLocationSharing();
+        showToast("Sharing session created! Acquiring location...", "info");
+    } else {
+        // Mode: Public key-value store (requires fetching an App Key dynamically)
+        showLoader("Initializing sync network...");
+        
+        fetch(`${PUBLIC_SYNC_SERVER}/GetAppKey`)
+            .then(res => res.json())
+            .then(appKey => {
+                hideLoader();
+                
+                state.activeShare = { cID, key, name: sharerName, exp, duration: minutes, appKey: appKey };
+                localStorage.setItem('pnear-active-share', JSON.stringify(state.activeShare));
+                
+                const shareUrl = `${window.location.origin}${window.location.pathname}?share=${cID}&app=${appKey}#${key}`;
+                el.shareUrlInput.value = shareUrl;
+                
+                state.mode = 'sharing';
+                switchView('sharing');
+                initMap();
+                startLocationSharing();
+                
+                showToast("Sharing session created! Acquiring location...", "info");
+            })
+            .catch(err => {
+                hideLoader();
+                console.error("Failed to generate app key:", err);
+                showToast("Network Error: Could not initialize sync broker. Check your internet connection.", "error");
+            });
+    }
 }
 
 function startLocationSharing() {
@@ -432,7 +470,7 @@ function handleLocationUpdate(position) {
     // Render on sharer's mini-map
     updateSharerMap(lat, lng, accuracy);
     
-    // Publish encrypted update to MQTT
+    // Publish encrypted update
     publishLocationPacket({
         lat,
         lng,
@@ -467,31 +505,58 @@ function publishLocationPacket(packet) {
     
     try {
         const payloadString = JSON.stringify(packet);
-        const encrypted = CryptoJS.AES.encrypt(payloadString, state.activeShare.key).toString();
         
-        const publishUrl = `${SYNC_SERVER}/${state.activeShare.cID}`;
+        // 1. Encrypt using AES
+        const encrypted = CryptoJS.AES.encrypt(payloadString, state.activeShare.key);
         
-        fetch(publishUrl, {
-            method: 'POST',
-            body: encrypted,
-            headers: {
-                'Content-Type': 'text/plain'
-            }
-        })
-        .then(response => {
-            if (response.ok) {
-                state.packetCount++;
-                el.statPackets.innerText = state.packetCount;
-                updateSyncStatus("connected", "Sync active (HTTPS)");
-            } else {
-                console.error("Sync publish failed with status:", response.status);
-                updateSyncStatus("offline", "Publish failed. Retrying...");
-            }
-        })
-        .catch(err => {
-            console.error("Sync publish network error:", err);
-            updateSyncStatus("offline", "Network error. Retrying...");
-        });
+        // 2. Convert to Hex string (forces clean alphanumeric output, avoiding IIS 404 slashes in paths)
+        const hexCiphertext = encrypted.ciphertext.toString(CryptoJS.enc.Hex);
+        
+        if (PRIVATE_SYNC_URL) {
+            // Private sync server mode (standard JSON POST)
+            fetch(PRIVATE_SYNC_URL, {
+                method: 'POST',
+                body: JSON.stringify({ key: state.activeShare.cID, val: hexCiphertext }),
+                headers: { 'Content-Type': 'application/json' }
+            })
+            .then(res => {
+                if (res.ok) {
+                    state.packetCount++;
+                    el.statPackets.innerText = state.packetCount;
+                    updateSyncStatus("connected", "Sync active (HTTPS)");
+                } else {
+                    updateSyncStatus("offline", "Sync warning: Cloud rejected packet.");
+                }
+            })
+            .catch(err => {
+                console.error("Private Sync error:", err);
+                updateSyncStatus("offline", "Network error. Retrying...");
+            });
+        } else {
+            // Public KV store mode
+            const url = `${PUBLIC_SYNC_SERVER}/UpdateValue/${state.activeShare.appKey}/${state.activeShare.cID}/${hexCiphertext}`;
+            
+            // IIS / ASP.NET requires Content-Length header for POSTs, so we pass body or empty declaration
+            fetch(url, {
+                method: 'POST',
+                body: '', 
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+            })
+            .then(res => res.json())
+            .then(success => {
+                if (success === true) {
+                    state.packetCount++;
+                    el.statPackets.innerText = state.packetCount;
+                    updateSyncStatus("connected", "Sync active (HTTPS)");
+                } else {
+                    updateSyncStatus("offline", "Sync issues. Retrying...");
+                }
+            })
+            .catch(err => {
+                console.error("Public sync publish error:", err);
+                updateSyncStatus("offline", "Network error. Retrying...");
+            });
+        }
     } catch (e) {
         console.error("Crypto/Publish exception:", e);
     }
@@ -510,13 +575,21 @@ function stopLocationSharing(isAutoExpired = false) {
     if (state.activeShare) {
         try {
             const stopPacket = { status: "stopped", exp: Date.now() };
-            const encrypted = CryptoJS.AES.encrypt(JSON.stringify(stopPacket), state.activeShare.key).toString();
+            const encrypted = CryptoJS.AES.encrypt(JSON.stringify(stopPacket), state.activeShare.key);
+            const hexCiphertext = encrypted.ciphertext.toString(CryptoJS.enc.Hex);
             
-            fetch(`${SYNC_SERVER}/${state.activeShare.cID}`, {
-                method: 'POST',
-                body: encrypted,
-                headers: { 'Content-Type': 'text/plain' }
-            }).catch(e => console.error("Failed to send stop notification:", e));
+            if (PRIVATE_SYNC_URL) {
+                fetch(PRIVATE_SYNC_URL, {
+                    method: 'POST',
+                    body: JSON.stringify({ key: state.activeShare.cID, val: hexCiphertext }),
+                    headers: { 'Content-Type': 'application/json' }
+                }).catch(e => console.error(e));
+            } else {
+                fetch(`${PUBLIC_SYNC_SERVER}/UpdateValue/${state.activeShare.appKey}/${state.activeShare.cID}/${hexCiphertext}`, {
+                    method: 'POST',
+                    body: ''
+                }).catch(e => console.error(e));
+            }
         } catch (e) {
             console.error(e);
         }
@@ -532,22 +605,16 @@ function stopLocationSharing(isAutoExpired = false) {
     releaseWakeLock();
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     
-    // 4. Close EventSource
-    if (state.eventSource) {
-        state.eventSource.close();
-        state.eventSource = null;
-    }
-    
-    // 5. Clean local storage state
+    // 4. Clean local storage state
     localStorage.removeItem('pnear-active-share');
     state.activeShare = null;
     
-    // 6. Reset UI stats
+    // 5. Reset UI stats
     el.statAccuracy.innerText = "--";
     el.statSpeed.innerText = "--";
     el.statPackets.innerText = "0";
     
-    // 7. Remove Map Markers
+    // 6. Remove Map Markers
     resetMapLayers();
     
     setTimeout(() => {
@@ -590,7 +657,7 @@ function handleVisibilityChange() {
     }
 }
 
-// --- SYNC SERVICE CONNECTION LAYER (HTTPS / SSE) ---
+// --- SYNC SERVICE CONNECTION LAYER (HTTPS GET/POST POLLING) ---
 
 function initViewerSync() {
     if (!state.viewer.cID) return;
@@ -598,38 +665,53 @@ function initViewerSync() {
     el.viewerStatusText.innerText = "Connecting to sync server...";
     el.viewerPulse.className = "pulse-dot green";
     
-    if (state.eventSource) {
-        state.eventSource.close();
+    // Clear previous poll interval if any exists
+    if (state.viewer.pollIntervalId) {
+        clearInterval(state.viewer.pollIntervalId);
     }
     
-    const sseUrl = `${SYNC_SERVER}/${state.viewer.cID}/sse`;
-    console.log("Connecting to SSE sync stream:", sseUrl);
+    // Poll immediately
+    pollSharedLocation();
     
-    state.eventSource = new EventSource(sseUrl);
+    // Set interval to poll every 5 seconds (5000ms)
+    state.viewer.pollIntervalId = setInterval(pollSharedLocation, 5000);
+}
+
+function pollSharedLocation() {
+    if (!state.viewer.cID) return;
     
-    state.eventSource.onopen = () => {
-        console.log("SSE Sync connection established.");
-        el.viewerStatusText.innerText = "Syncing live location...";
-        el.viewerPulse.className = "pulse-dot green";
-        showToast("Connected to sync service!", "success");
-    };
+    // Cache bust query parameter
+    const cacheBuster = `_t=${Date.now()}`;
     
-    state.eventSource.onmessage = (event) => {
-        try {
-            const data = JSON.parse(event.data);
-            if (data && data.message) {
-                handleIncomingCiphertext(data.message);
+    let fetchPromise;
+    if (PRIVATE_SYNC_URL) {
+        fetchPromise = fetch(`${PRIVATE_SYNC_URL}?key=${state.viewer.cID}&${cacheBuster}`);
+    } else {
+        fetchPromise = fetch(`${PUBLIC_SYNC_SERVER}/GetValue/${state.viewer.appKey}/${state.viewer.cID}?${cacheBuster}`);
+    }
+    
+    fetchPromise
+        .then(res => {
+            if (!res.ok) throw new Error("Server responded with error status " + res.status);
+            return res.text();
+        })
+        .then(responseText => {
+            // Strip any surrounding double quotes returned by the JSON API
+            const hexCiphertext = responseText.replace(/"/g, '').trim();
+            if (!hexCiphertext || hexCiphertext === "null" || hexCiphertext === "") {
+                console.log("No data stored under this key yet.");
+                return;
             }
-        } catch (e) {
-            console.error("Error parsing SSE data:", e);
-        }
-    };
-    
-    state.eventSource.onerror = (err) => {
-        console.error("SSE stream connection error:", err);
-        el.viewerStatusText.innerText = "Reconnecting...";
-        el.viewerPulse.className = "pulse-dot red";
-    };
+            
+            // Decrypt and process coordinates
+            handleIncomingHexCiphertext(hexCiphertext);
+        })
+        .catch(err => {
+            console.error("Sync polling error:", err);
+            // Don't toast on every polling fail to prevent UI pollution, just reflect in status
+            el.viewerStatusText.innerText = "Offline / Connection Weak";
+            el.viewerPulse.className = "pulse-dot red";
+        });
 }
 
 function updateSyncStatus(status, text) {
@@ -645,56 +727,61 @@ function updateSyncStatus(status, text) {
     lucide.createIcons({ attrs: { class: 'status-icon' } });
 }
 
-function handleIncomingCiphertext(ciphertext) {
-    if (state.mode === 'viewer' && state.viewer.cID) {
-        try {
-            // Decrypt ciphertext using key
-            const bytes = CryptoJS.AES.decrypt(ciphertext, state.viewer.key);
-            const decryptedStr = bytes.toString(CryptoJS.enc.Utf8);
-            
-            if (!decryptedStr) {
-                console.error("Decrypted string is empty. Incorrect decryption key!");
-                return;
-            }
-            
-            const packet = JSON.parse(decryptedStr);
-            
-            // Handle stopped packet
-            if (packet.status === "stopped") {
-                el.viewerStatusText.innerText = "Sharing stopped by user";
-                el.viewerPulse.className = "pulse-dot red";
-                showToast(`${state.viewer.sharerName} has stopped sharing their location.`, "warning");
-                if (state.eventSource) {
-                    state.eventSource.close();
-                    state.eventSource = null;
-                }
-                return;
-            }
-            
-            // Process fresh position
-            state.viewer.sharerName = packet.name;
-            state.viewer.exp = packet.exp;
-            state.viewer.lastPingTime = Date.now();
-            state.viewer.coords = { lat: packet.lat, lng: packet.lng };
-            
-            // Update header info
-            el.viewerSharerName.innerText = packet.name;
-            el.viewerStatusText.innerText = "Live";
-            el.viewerPulse.className = "pulse-dot green";
-            
-            // Speed & Ping UI
-            el.viewStatSpeed.innerText = packet.spd !== null ? `${packet.spd} km/h` : "0 km/h";
-            el.viewStatPing.innerText = "Just now";
-            
-            // Calculate distance if viewer enabled their own location
-            updateDistanceUI();
-            
-            // Update Map
-            updateViewerMap(packet.lat, packet.lng, packet.acc);
-            
-        } catch (e) {
-            console.error("Failed to decrypt or parse sync packet:", e);
+function handleIncomingHexCiphertext(hexString) {
+    if (state.mode !== 'viewer' || !state.viewer.cID) return;
+    
+    try {
+        // Recreate CipherParams from Hex String
+        const cipherParams = CryptoJS.lib.CipherParams.create({
+            ciphertext: CryptoJS.enc.Hex.parse(hexString)
+        });
+        
+        // Decrypt using Key
+        const decryptedStr = CryptoJS.AES.decrypt(cipherParams, state.viewer.key).toString(CryptoJS.enc.Utf8);
+        
+        if (!decryptedStr) {
+            console.error("Hex Decrypted string is empty. Key mismatch!");
+            return;
         }
+        
+        const packet = JSON.parse(decryptedStr);
+        
+        // Handle stopped packet
+        if (packet.status === "stopped") {
+            el.viewerStatusText.innerText = "Sharing stopped by user";
+            el.viewerPulse.className = "pulse-dot red";
+            showToast(`${state.viewer.sharerName} has stopped sharing their location.`, "warning");
+            
+            if (state.viewer.pollIntervalId) {
+                clearInterval(state.viewer.pollIntervalId);
+                state.viewer.pollIntervalId = null;
+            }
+            return;
+        }
+        
+        // Process fresh position
+        state.viewer.sharerName = packet.name;
+        state.viewer.exp = packet.exp;
+        state.viewer.lastPingTime = Date.now();
+        state.viewer.coords = { lat: packet.lat, lng: packet.lng };
+        
+        // Update header info
+        el.viewerSharerName.innerText = packet.name;
+        el.viewerStatusText.innerText = "Live";
+        el.viewerPulse.className = "pulse-dot green";
+        
+        // Speed & Ping UI
+        el.viewStatSpeed.innerText = packet.spd !== null ? `${packet.spd} km/h` : "0 km/h";
+        el.viewStatPing.innerText = "Just now";
+        
+        // Calculate distance if viewer enabled their own location
+        updateDistanceUI();
+        
+        // Update Map
+        updateViewerMap(packet.lat, packet.lng, packet.acc);
+        
+    } catch (e) {
+        console.error("Failed to decrypt or parse Hex sync packet:", e);
     }
 }
 
@@ -711,7 +798,7 @@ function initMap() {
     
     // Load thematic tiles
     state.tileLayer = L.tileLayer(MAP_THEMES[state.theme].url, {
-        attribution: MAP_THEMES[state.theme].attribution,
+        attribution: MAP_THEMES[theme].attribution,
         maxZoom: 19
     }).addTo(state.map);
     
@@ -766,7 +853,6 @@ function updateViewerMap(lat, lng, accuracy) {
     const latlng = [lat, lng];
     
     // Add point to tracking history (breadcrumbs)
-    // Avoid repeating coordinates to keep line clean
     const historyLen = state.viewer.history.length;
     if (historyLen === 0 || (state.viewer.history[historyLen-1][0] !== lat || state.viewer.history[historyLen-1][1] !== lng)) {
         state.viewer.history.push(latlng);
@@ -871,7 +957,7 @@ function toggleViewerLocation() {
                 state.viewer.myWatchId = null;
                 el.btnToggleMyLocation.querySelector('span').innerText = "Show my location to measure distance";
             },
-            { enableHighAccuracy: true }
+            { enableHighAccuracy: true, timeout: 8000 }
         );
     }
 }
@@ -907,7 +993,6 @@ function openDirections() {
         const lat = state.viewer.coords.lat;
         const lng = state.viewer.coords.lng;
         
-        // Open Navigation (universal link, maps will trigger native app or Google maps web)
         const url = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
         window.open(url, '_blank');
     } else {
