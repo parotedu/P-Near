@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P-Near - Temporary Live Location Sharing</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- Leaflet Map CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="style.css">
+    
+    <!-- Favicon placeholder (Uses an SVG data URL for a cool locator pin) -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%236366f1'%3E%3Cpath d='M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z'/%3E%3C/svg%3E">
+</head>
+<body>
+    <!-- Main App Wrapper -->
+    <div id="app" class="app-container">
+        
+        <!-- Live Map Background (Used for Viewer & Sharer status) -->
+        <div id="map-container" class="map-wrapper hidden">
+            <div id="map"></div>
+        </div>
+
+        <!-- Dynamic Dark/Light Theme Toggle -->
+        <button id="theme-toggle" class="theme-btn" title="Toggle Theme" aria-label="Toggle Theme">
+            <i data-lucide="moon" class="dark-icon"></i>
+            <i data-lucide="sun" class="light-icon"></i>
+        </button>
+
+        <!-- Dashboard View (Setup Sharing) -->
+        <div id="dashboard-view" class="view-panel active">
+            <div class="glass-card main-setup-card">
+                <div class="logo-area animate-fade-in">
+                    <div class="logo-icon">
+                        <i data-lucide="map-pin" class="pin-icon-animated"></i>
+                    </div>
+                    <h1>P-Near</h1>
+                    <p class="tagline">Secure, Temporary, Real-Time Location Sharing</p>
+                </div>
+
+                <div class="setup-form animate-slide-up">
+                    <!-- Name Input -->
+                    <div class="form-group">
+                        <label for="sharer-name">
+                            <i data-lucide="user" class="label-icon"></i>
+                            Your Display Name
+                        </label>
+                        <input type="text" id="sharer-name" placeholder="Anonymous Friend" maxlength="20" autocomplete="off">
+                    </div>
+
+                    <!-- Duration Selection -->
+                    <div class="form-group">
+                        <label>
+                            <i data-lucide="clock" class="label-icon"></i>
+                            Sharing Duration
+                        </label>
+                        <div class="duration-grid">
+                            <button type="button" class="duration-btn" data-minutes="15">
+                                <span class="val">15</span>
+                                <span class="unit">Mins</span>
+                            </button>
+                            <button type="button" class="duration-btn active" data-minutes="60">
+                                <span class="val">1</span>
+                                <span class="unit">Hour</span>
+                            </button>
+                            <button type="button" class="duration-btn" data-minutes="240">
+                                <span class="val">4</span>
+                                <span class="unit">Hours</span>
+                            </button>
+                            <button type="button" class="duration-btn" data-minutes="480">
+                                <span class="val">8</span>
+                                <span class="unit">Hours</span>
+                            </button>
+                            <button type="button" class="duration-btn" data-minutes="1440">
+                                <span class="val">24</span>
+                                <span class="unit">Hours</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Start Button -->
+                    <button id="btn-start-share" class="btn-primary">
+                        <i data-lucide="share-2"></i>
+                        <span>Start Sharing Location</span>
+                    </button>
+                </div>
+
+                <!-- Feature Badges -->
+                <div class="features-row animate-fade-in">
+                    <div class="feature-item">
+                        <i data-lucide="shield-check" class="icon-green"></i>
+                        <span>End-to-End Encrypted</span>
+                    </div>
+                    <div class="feature-item">
+                        <i data-lucide="server-off" class="icon-blue"></i>
+                        <span>Serverless (P2P Client)</span>
+                    </div>
+                    <div class="feature-item">
+                        <i data-lucide="heart" class="icon-red"></i>
+                        <span>No Signup / Free</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Sharing Control Panel (Active Share Status) -->
+        <div id="sharing-view" class="view-panel hidden">
+            <div class="glass-card floating-card bottom-card">
+                <div class="card-header">
+                    <div class="status-indicator">
+                        <span class="pulse-dot red"></span>
+                        <span class="status-text font-bold">Sharing Location Live</span>
+                    </div>
+                    <div id="sharing-timer" class="countdown-badge">--:--</div>
+                </div>
+
+                <div class="sharing-details">
+                    <!-- Share Link Block -->
+                    <div class="share-link-box">
+                        <label for="share-url">Send this link to others:</label>
+                        <div class="input-copy-group">
+                            <input type="text" id="share-url" readonly value="" placeholder="Generating link...">
+                            <button id="btn-copy-link" class="btn-icon" title="Copy Link">
+                                <i data-lucide="copy" class="copy-default"></i>
+                                <i data-lucide="check" class="copy-success hidden"></i>
+                            </button>
+                            <button id="btn-share-api" class="btn-icon" title="Share Link">
+                                <i data-lucide="send"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Live Stats Dashboard -->
+                    <div class="stats-row">
+                        <div class="stat-card">
+                            <span class="stat-label">Accuracy</span>
+                            <span id="stat-accuracy" class="stat-val">--</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-label">Speed</span>
+                            <span id="stat-speed" class="stat-val">--</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-label">Updates Sent</span>
+                            <span id="stat-packets" class="stat-val">0</span>
+                        </div>
+                    </div>
+
+                    <!-- Network Status -->
+                    <div class="network-badge">
+                        <i data-lucide="wifi" id="wifi-icon" class="status-icon green"></i>
+                        <span id="network-status-text">Connecting to sync service...</span>
+                    </div>
+
+                    <!-- Wakelock and Action Controls -->
+                    <div class="actions-row">
+                        <button id="btn-stop-share" class="btn-danger">
+                            <i data-lucide="square"></i>
+                            <span>Stop Sharing</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Viewer Panel (Viewing Someone Else's Location) -->
+        <div id="viewer-view" class="view-panel hidden">
+            <!-- Top Nav Info Bar -->
+            <div class="glass-card floating-card top-card">
+                <div class="viewer-header">
+                    <div class="viewer-user">
+                        <i data-lucide="user" class="user-avatar-icon"></i>
+                        <div>
+                            <h2 id="viewer-sharer-name">Someone</h2>
+                            <p class="sub-status"><span class="pulse-dot green" id="viewer-pulse"></span> <span id="viewer-status-text">Connecting...</span></p>
+                        </div>
+                    </div>
+                    <div class="viewer-timer-block">
+                        <span class="time-label">Expires in</span>
+                        <span id="viewer-timer" class="time-val">--:--</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Bottom Control Overlay -->
+            <div class="glass-card floating-card bottom-card">
+                <div class="viewer-stats">
+                    <div class="stats-row">
+                        <div class="stat-card">
+                            <span class="stat-label">Speed</span>
+                            <span id="view-stat-speed" class="stat-val">--</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-label">Distance to you</span>
+                            <span id="view-stat-distance" class="stat-val">--</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-label">Last Ping</span>
+                            <span id="view-stat-ping" class="stat-val">--</span>
+                        </div>
+                    </div>
+
+                    <div class="actions-row grid-2">
+                        <button id="btn-directions" class="btn-secondary">
+                            <i data-lucide="navigation"></i>
+                            <span>Get Directions</span>
+                        </button>
+                        <button id="btn-recenter" class="btn-primary">
+                            <i data-lucide="target"></i>
+                            <span>Center on User</span>
+                        </button>
+                    </div>
+
+                    <!-- Viewer Personal Tracking Button -->
+                    <button id="btn-toggle-my-location" class="btn-outline-text text-sm">
+                        <i data-lucide="navigation-2"></i>
+                        <span>Show my location to measure distance</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Notifications Toast System -->
+        <div id="toast-container" class="toast-wrapper"></div>
+
+        <!-- Global Loader Overlay -->
+        <div id="global-loader" class="loader-overlay hidden">
+            <div class="spinner"></div>
+            <p id="loader-text">Loading map and establishing connections...</p>
+        </div>
+    </div>
+
+    <!-- Leaflet Map JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    
+    <!-- CryptoJS (for AES symmetric encryption of location data) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js" integrity="sha512-E8QSvWZ0Ge9L92xeQskbOBhtxggcOtd01h5emMHO3sLUMT5zZOTFEXc5530ae0O5a4cEc1Mib11tLqn3QHCDWw==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    
+    <!-- MQTT.js (for Websockets MQTT Sync) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/4.3.7/mqtt.min.js" integrity="sha512-Yv4wNl7kZ0r08vP5xU9zJ7r66k91EcdK9pL+09c3n3L/3s3WvW9s8Fw12f32+5q+73g2e+a0w/tXm+Wz/zL8w==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@0.344.0/dist/umd/lucide.min.js"></script>
+    
+    <!-- Custom Application Code -->
+    <script src="app.js"></script>
+</body>
+</html>
