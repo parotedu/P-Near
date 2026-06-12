@@ -3,13 +3,7 @@
  * Client-side core logic and MQTT/Leaflet integration.
  */
 
-// Broker Configurations with WebSockets SSL ports
-const BROKERS = [
-    { name: "Eclipse Projects", url: "wss://mqtt.eclipseprojects.io:443/mqtt" },
-    { name: "HiveMQ Public", url: "wss://broker.hivemq.com:8884/mqtt" },
-    { name: "EMQX Public", url: "wss://broker.emqx.io:8084/mqtt" },
-    { name: "Mosquitto Public", url: "wss://test.mosquitto.org:8081/mqtt" }
-];
+const SYNC_SERVER = "https://ntfy.sh";
 
 // Map Configurations
 const MAP_THEMES = {
@@ -28,7 +22,6 @@ let state = {
     theme: 'dark',
     mode: 'dashboard', // 'dashboard', 'sharing', 'viewer'
     usingHighAccuracy: true, // track accuracy preference
-    connectionAttempts: 0, // track consecutive connection failures
     // Sharer specific state
     activeShare: null, // { cID, key, name, exp, duration }
     watchId: null,
@@ -53,10 +46,8 @@ let state = {
     sharerMarker: null,
     viewerMarker: null, // Viewer's own location marker
     breadcrumbsPolyline: null,
-    // MQTT connection state
-    mqttClient: null,
-    currentBrokerIndex: 0,
-    isConnectingMqtt: false
+    // Sync stream connection state
+    eventSource: null
 };
 
 // DOM Elements
@@ -138,7 +129,7 @@ function routeApp() {
         
         switchView('viewer');
         initMap();
-        initMqttViewer();
+        initViewerSync();
     } else {
         // Mode: Sharer / Dashboard
         // Check if there is an active local storage share session
@@ -385,13 +376,12 @@ function startLocationSharing() {
     el.statPackets.innerText = "0";
     el.statAccuracy.innerText = "Searching...";
     
-    // 1. Setup MQTT publisher connection
-    initMqttPublisher();
+    updateSyncStatus("connected", "Sync active (HTTPS)");
     
-    // 2. Setup Screen Wake Lock (to keep mobile screen alive)
+    // 1. Setup Screen Wake Lock (to keep mobile screen alive)
     requestWakeLock();
     
-    // 3. Start Geolocation Watching
+    // 2. Start Geolocation Watching
     startWatching(true); // Start with high accuracy
     
     // Listen for wake lock release
@@ -473,23 +463,34 @@ function handleLocationError(error) {
 }
 
 function publishLocationPacket(packet) {
-    if (!state.mqttClient || !state.mqttClient.connected) {
-        console.warn("MQTT client not ready, packet skipped.");
-        return;
-    }
+    if (!state.activeShare) return;
     
     try {
         const payloadString = JSON.stringify(packet);
         const encrypted = CryptoJS.AES.encrypt(payloadString, state.activeShare.key).toString();
         
-        const topic = `pnear/track/${state.activeShare.cID}`;
-        state.mqttClient.publish(topic, encrypted, { qos: 1 }, (err) => {
-            if (!err) {
+        const publishUrl = `${SYNC_SERVER}/${state.activeShare.cID}`;
+        
+        fetch(publishUrl, {
+            method: 'POST',
+            body: encrypted,
+            headers: {
+                'Content-Type': 'text/plain'
+            }
+        })
+        .then(response => {
+            if (response.ok) {
                 state.packetCount++;
                 el.statPackets.innerText = state.packetCount;
+                updateSyncStatus("connected", "Sync active (HTTPS)");
             } else {
-                console.error("MQTT publish error:", err);
+                console.error("Sync publish failed with status:", response.status);
+                updateSyncStatus("offline", "Publish failed. Retrying...");
             }
+        })
+        .catch(err => {
+            console.error("Sync publish network error:", err);
+            updateSyncStatus("offline", "Network error. Retrying...");
         });
     } catch (e) {
         console.error("Crypto/Publish exception:", e);
@@ -506,11 +507,16 @@ function stopLocationSharing(isAutoExpired = false) {
     showLoader("Stopping sharing session...");
     
     // 1. Notify viewers that sharing stopped
-    if (state.mqttClient && state.mqttClient.connected && state.activeShare) {
+    if (state.activeShare) {
         try {
             const stopPacket = { status: "stopped", exp: Date.now() };
             const encrypted = CryptoJS.AES.encrypt(JSON.stringify(stopPacket), state.activeShare.key).toString();
-            state.mqttClient.publish(`pnear/track/${state.activeShare.cID}`, encrypted, { qos: 1 });
+            
+            fetch(`${SYNC_SERVER}/${state.activeShare.cID}`, {
+                method: 'POST',
+                body: encrypted,
+                headers: { 'Content-Type': 'text/plain' }
+            }).catch(e => console.error("Failed to send stop notification:", e));
         } catch (e) {
             console.error(e);
         }
@@ -526,10 +532,10 @@ function stopLocationSharing(isAutoExpired = false) {
     releaseWakeLock();
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     
-    // 4. Close MQTT
-    if (state.mqttClient) {
-        state.mqttClient.end();
-        state.mqttClient = null;
+    // 4. Close EventSource
+    if (state.eventSource) {
+        state.eventSource.close();
+        state.eventSource = null;
     }
     
     // 5. Clean local storage state
@@ -584,164 +590,54 @@ function handleVisibilityChange() {
     }
 }
 
-// --- MQTT CONNECTION LAYER ---
+// --- SYNC SERVICE CONNECTION LAYER (HTTPS / SSE) ---
 
-function initMqttPublisher() {
-    if (!state.activeShare) return;
-    
-    updateMqttStatus("connecting", "Connecting to sync broker...");
-    connectMqttClient(() => {
-        // Subscribing to request topic: this lets viewers ping us to request an immediate update
-        const requestTopic = `pnear/request/${state.activeShare.cID}`;
-        state.mqttClient.subscribe(requestTopic, { qos: 1 }, (err) => {
-            if (!err) {
-                console.log("Subscribed to immediate update request channel:", requestTopic);
-            }
-        });
-        
-        // Publish first location packet immediately if we have it
-        if (state.lastPublishedCoords) {
-            handleLocationUpdate({
-                coords: {
-                    latitude: state.lastPublishedCoords.lat,
-                    longitude: state.lastPublishedCoords.lng,
-                    accuracy: 10, // approximate
-                    speed: 0,
-                    heading: 0
-                }
-            });
-        }
-    });
-}
-
-function initMqttViewer() {
+function initViewerSync() {
     if (!state.viewer.cID) return;
     
-    el.viewerStatusText.innerText = "Connecting to sync broker...";
-    el.viewerPulse.className = "pulse-dot green"; // Green represents attempting
+    el.viewerStatusText.innerText = "Connecting to sync server...";
+    el.viewerPulse.className = "pulse-dot green";
     
-    connectMqttClient(() => {
-        const trackTopic = `pnear/track/${state.viewer.cID}`;
-        state.mqttClient.subscribe(trackTopic, { qos: 1 }, (err) => {
-            if (!err) {
-                el.viewerStatusText.innerText = "Waiting for location signal...";
-                showToast("Connected! Syncing location data...", "info");
-                
-                // Publish instant ping request to tell the sharer to broadcast immediately
-                const requestTopic = `pnear/request/${state.viewer.cID}`;
-                state.mqttClient.publish(requestTopic, "ping", { qos: 1 });
-            } else {
-                console.error("Subcription error:", err);
-                showToast("Failed to subscribe to tracking data.", "error");
-            }
-        });
-    });
-}
-
-function connectMqttClient(onConnectCallback) {
-    if (state.mqttClient) {
-        state.mqttClient.end(true);
+    if (state.eventSource) {
+        state.eventSource.close();
     }
     
-    const broker = BROKERS[state.currentBrokerIndex];
-    console.log(`Connecting to MQTT broker: ${broker.name} (${broker.url})`);
+    const sseUrl = `${SYNC_SERVER}/${state.viewer.cID}/sse`;
+    console.log("Connecting to SSE sync stream:", sseUrl);
     
-    state.isConnectingMqtt = true;
+    state.eventSource = new EventSource(sseUrl);
     
-    // Set a timeout to switch brokers if connection hangs
-    const fallbackTimeout = setTimeout(() => {
-        if (state.isConnectingMqtt) {
-            console.warn(`Connection to ${broker.name} timed out. Attempting next broker...`);
-            handleMqttConnectionFallback(onConnectCallback);
+    state.eventSource.onopen = () => {
+        console.log("SSE Sync connection established.");
+        el.viewerStatusText.innerText = "Syncing live location...";
+        el.viewerPulse.className = "pulse-dot green";
+        showToast("Connected to sync service!", "success");
+    };
+    
+    state.eventSource.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            if (data && data.message) {
+                handleIncomingCiphertext(data.message);
+            }
+        } catch (e) {
+            console.error("Error parsing SSE data:", e);
         }
-    }, 6000);
+    };
     
-    try {
-        state.mqttClient = mqtt.connect(broker.url, {
-            clientId: 'pnear_' + Math.random().toString(36).substr(2, 9),
-            connectTimeout: 5000,
-            reconnectPeriod: 10000,
-            keepalive: 60,
-            clean: true
-        });
-        
-        state.mqttClient.on('connect', () => {
-            clearTimeout(fallbackTimeout);
-            state.isConnectingMqtt = false;
-            state.connectionAttempts = 0; // Reset counter on success
-            console.log(`Connected to broker: ${broker.name}`);
-            
-            if (state.mode === 'sharing') {
-                updateMqttStatus("connected", `Syncing via ${broker.name}`);
-            } else if (state.mode === 'viewer') {
-                el.viewerStatusText.innerText = "Syncing live location...";
-                el.viewerPulse.className = "pulse-dot green";
-            }
-            
-            if (onConnectCallback) onConnectCallback();
-        });
-        
-        state.mqttClient.on('message', (topic, message) => {
-            handleMqttIncomingMessage(topic, message.toString());
-        });
-        
-        state.mqttClient.on('error', (err) => {
-            console.error("MQTT client error:", err);
-            // Let the timeout or offline handler deal with it
-        });
-        
-        state.mqttClient.on('offline', () => {
-            console.warn("MQTT client offline.");
-            if (state.mode === 'sharing') {
-                updateMqttStatus("offline", "Network offline. Retrying...");
-            }
-        });
-        
-    } catch (e) {
-        clearTimeout(fallbackTimeout);
-        state.isConnectingMqtt = false;
-        console.error("MQTT connect syntax error:", e);
-        handleMqttConnectionFallback(onConnectCallback);
-    }
+    state.eventSource.onerror = (err) => {
+        console.error("SSE stream connection error:", err);
+        el.viewerStatusText.innerText = "Reconnecting...";
+        el.viewerPulse.className = "pulse-dot red";
+    };
 }
 
-function handleMqttConnectionFallback(onConnectCallback) {
-    if (state.mqttClient) {
-        state.mqttClient.end(true);
-        state.mqttClient = null;
-    }
-    
-    // Move to next broker index with circular boundary
-    state.currentBrokerIndex = (state.currentBrokerIndex + 1) % BROKERS.length;
-    const nextBroker = BROKERS[state.currentBrokerIndex];
-    console.log(`Switching sync node to: ${nextBroker.name}`);
-    
-    state.connectionAttempts = (state.connectionAttempts || 0) + 1;
-    if (state.connectionAttempts >= BROKERS.length) {
-        showToast("Slow connection. If using Brave or an AdBlocker, try pausing Shields.", "warning");
-    }
-    
-    if (state.mode === 'sharing') {
-        updateMqttStatus("connecting", `Trying network node ${state.currentBrokerIndex + 1}...`);
-    } else if (state.mode === 'viewer') {
-        el.viewerStatusText.innerText = `Retrying node ${state.currentBrokerIndex + 1}...`;
-    }
-    
-    // Reconnect after brief pause
-    setTimeout(() => {
-        connectMqttClient(onConnectCallback);
-    }, 1500);
-}
-
-function updateMqttStatus(status, text) {
+function updateSyncStatus(status, text) {
     el.networkStatusText.innerText = text;
     
     if (status === 'connected') {
         el.wifiIcon.className = "status-icon green";
         el.wifiIcon.setAttribute('data-lucide', 'wifi');
-    } else if (status === 'connecting') {
-        el.wifiIcon.className = "status-icon warning";
-        el.wifiIcon.setAttribute('data-lucide', 'wifi-off');
     } else {
         el.wifiIcon.className = "status-icon danger";
         el.wifiIcon.setAttribute('data-lucide', 'wifi-off');
@@ -749,82 +645,55 @@ function updateMqttStatus(status, text) {
     lucide.createIcons({ attrs: { class: 'status-icon' } });
 }
 
-function handleMqttIncomingMessage(topic, ciphertext) {
-    // 1. Sharer: Check for PING request from new viewers
-    if (state.mode === 'sharing' && state.activeShare) {
-        const requestTopic = `pnear/request/${state.activeShare.cID}`;
-        if (topic === requestTopic && ciphertext === "ping") {
-            console.log("Immediate update requested by viewer. Broadcasting coordinates.");
-            // If we have coordinates, push update instantly
-            if (state.lastPublishedCoords) {
-                // Request current position asynchronously to publish freshest accuracy
-                navigator.geolocation.getCurrentPosition((pos) => {
-                    handleLocationUpdate(pos);
-                }, () => {
-                    // Fallback to last known coords
-                    publishLocationPacket({
-                        lat: state.lastPublishedCoords.lat,
-                        lng: state.lastPublishedCoords.lng,
-                        acc: 15,
-                        spd: 0,
-                        name: state.activeShare.name,
-                        exp: state.activeShare.exp
-                    });
-                }, { enableHighAccuracy: state.usingHighAccuracy, timeout: 5000 });
-            }
-        }
-        return;
-    }
-    
-    // 2. Viewer: Decrypt location updates
+function handleIncomingCiphertext(ciphertext) {
     if (state.mode === 'viewer' && state.viewer.cID) {
-        const trackTopic = `pnear/track/${state.viewer.cID}`;
-        if (topic === trackTopic) {
-            try {
-                // Decrypt ciphertext using key
-                const bytes = CryptoJS.AES.decrypt(ciphertext, state.viewer.key);
-                const decryptedStr = bytes.toString(CryptoJS.enc.Utf8);
-                
-                if (!decryptedStr) {
-                    console.error("Decrypted string is empty. Incorrect decryption key!");
-                    return;
-                }
-                
-                const packet = JSON.parse(decryptedStr);
-                
-                // Handle stopped packet
-                if (packet.status === "stopped") {
-                    el.viewerStatusText.innerText = "Sharing stopped by user";
-                    el.viewerPulse.className = "pulse-dot red";
-                    showToast(`${state.viewer.sharerName} has stopped sharing their location.`, "warning");
-                    if (state.mqttClient) state.mqttClient.end();
-                    return;
-                }
-                
-                // Process fresh position
-                state.viewer.sharerName = packet.name;
-                state.viewer.exp = packet.exp;
-                state.viewer.lastPingTime = Date.now();
-                state.viewer.coords = { lat: packet.lat, lng: packet.lng };
-                
-                // Update header info
-                el.viewerSharerName.innerText = packet.name;
-                el.viewerStatusText.innerText = "Live";
-                el.viewerPulse.className = "pulse-dot green";
-                
-                // Speed & Ping UI
-                el.viewStatSpeed.innerText = packet.spd !== null ? `${packet.spd} km/h` : "0 km/h";
-                el.viewStatPing.innerText = "Just now";
-                
-                // Calculate distance if viewer enabled their own location
-                updateDistanceUI();
-                
-                // Update Map
-                updateViewerMap(packet.lat, packet.lng, packet.acc);
-                
-            } catch (e) {
-                console.error("Failed to decrypt or parse MQTT packet:", e);
+        try {
+            // Decrypt ciphertext using key
+            const bytes = CryptoJS.AES.decrypt(ciphertext, state.viewer.key);
+            const decryptedStr = bytes.toString(CryptoJS.enc.Utf8);
+            
+            if (!decryptedStr) {
+                console.error("Decrypted string is empty. Incorrect decryption key!");
+                return;
             }
+            
+            const packet = JSON.parse(decryptedStr);
+            
+            // Handle stopped packet
+            if (packet.status === "stopped") {
+                el.viewerStatusText.innerText = "Sharing stopped by user";
+                el.viewerPulse.className = "pulse-dot red";
+                showToast(`${state.viewer.sharerName} has stopped sharing their location.`, "warning");
+                if (state.eventSource) {
+                    state.eventSource.close();
+                    state.eventSource = null;
+                }
+                return;
+            }
+            
+            // Process fresh position
+            state.viewer.sharerName = packet.name;
+            state.viewer.exp = packet.exp;
+            state.viewer.lastPingTime = Date.now();
+            state.viewer.coords = { lat: packet.lat, lng: packet.lng };
+            
+            // Update header info
+            el.viewerSharerName.innerText = packet.name;
+            el.viewerStatusText.innerText = "Live";
+            el.viewerPulse.className = "pulse-dot green";
+            
+            // Speed & Ping UI
+            el.viewStatSpeed.innerText = packet.spd !== null ? `${packet.spd} km/h` : "0 km/h";
+            el.viewStatPing.innerText = "Just now";
+            
+            // Calculate distance if viewer enabled their own location
+            updateDistanceUI();
+            
+            // Update Map
+            updateViewerMap(packet.lat, packet.lng, packet.acc);
+            
+        } catch (e) {
+            console.error("Failed to decrypt or parse sync packet:", e);
         }
     }
 }
