@@ -26,6 +26,7 @@ const MAP_THEMES = {
 let state = {
     theme: 'dark',
     mode: 'dashboard', // 'dashboard', 'sharing', 'viewer'
+    usingHighAccuracy: true, // track accuracy preference
     // Sharer specific state
     activeShare: null, // { cID, key, name, exp, duration }
     watchId: null,
@@ -354,50 +355,33 @@ function handleStartShare() {
         return;
     }
     
-    showLoader("Requesting location access...");
+    // Generate sharing credentials instantly
+    const cID = "pnear_" + generateRandomId(16);
+    const key = generateRandomId(24); // Crypto key
+    const exp = Date.now() + (minutes * 60 * 1000);
     
-    navigator.geolocation.getCurrentPosition(
-        (position) => {
-            // Permission granted, setup sharing session
-            hideLoader();
-            
-            const cID = "pnear_" + generateRandomId(16);
-            const key = generateRandomId(24); // Crypto key
-            const exp = Date.now() + (minutes * 60 * 1000);
-            
-            state.activeShare = { cID, key, name: sharerName, exp, duration: minutes };
-            localStorage.setItem('pnear-active-share', JSON.stringify(state.activeShare));
-            
-            // Set URL
-            const shareUrl = `${window.location.origin}${window.location.pathname}?share=${cID}#${key}`;
-            el.shareUrlInput.value = shareUrl;
-            
-            // Switch screen
-            state.mode = 'sharing';
-            switchView('sharing');
-            initMap();
-            
-            // Start components
-            startLocationSharing();
-            
-            showToast("Location sharing session started!", "success");
-        },
-        (error) => {
-            hideLoader();
-            console.error("Location permission error:", error);
-            if (error.code === error.PERMISSION_DENIED) {
-                showToast("Location access denied. We need GPS permission to track your movement.", "error");
-            } else {
-                showToast("Error retrieving your location: " + error.message, "error");
-            }
-        },
-        { enableHighAccuracy: true }
-    );
+    state.activeShare = { cID, key, name: sharerName, exp, duration: minutes };
+    localStorage.setItem('pnear-active-share', JSON.stringify(state.activeShare));
+    
+    // Set URL
+    const shareUrl = `${window.location.origin}${window.location.pathname}?share=${cID}#${key}`;
+    el.shareUrlInput.value = shareUrl;
+    
+    // Switch screen to sharing view
+    state.mode = 'sharing';
+    switchView('sharing');
+    initMap();
+    
+    // Start components (MQTT, Wakelock, Location Watch)
+    startLocationSharing();
+    
+    showToast("Sharing session created! Acquiring location...", "info");
 }
 
 function startLocationSharing() {
     state.packetCount = 0;
     el.statPackets.innerText = "0";
+    el.statAccuracy.innerText = "Searching...";
     
     // 1. Setup MQTT publisher connection
     initMqttPublisher();
@@ -406,9 +390,22 @@ function startLocationSharing() {
     requestWakeLock();
     
     // 3. Start Geolocation Watching
+    startWatching(true); // Start with high accuracy
+    
+    // Listen for wake lock release
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+}
+
+function startWatching(highAccuracy) {
+    if (state.watchId !== null) {
+        navigator.geolocation.clearWatch(state.watchId);
+    }
+    
+    state.usingHighAccuracy = highAccuracy;
+    
     const geoOptions = {
-        enableHighAccuracy: true,
-        timeout: 10000,
+        enableHighAccuracy: highAccuracy,
+        timeout: 8000, // 8 seconds timeout
         maximumAge: 0
     };
     
@@ -417,9 +414,13 @@ function startLocationSharing() {
         handleLocationError,
         geoOptions
     );
-    
-    // Listen for wake lock release
-    document.addEventListener('visibilitychange', handleVisibilityChange);
+}
+
+function restartWatchWithLowAccuracy() {
+    if (state.usingHighAccuracy) {
+        console.log("Switching to low accuracy geolocation watch due to timeout");
+        startWatching(false);
+    }
 }
 
 function handleLocationUpdate(position) {
@@ -453,7 +454,20 @@ function handleLocationUpdate(position) {
 
 function handleLocationError(error) {
     console.error("Geolocation watch error:", error);
-    showToast("GPS Signal weak: " + error.message, "warning");
+    
+    if (error.code === error.PERMISSION_DENIED) {
+        showToast("Location access denied. We need GPS permission to track your movement.", "error");
+        stopLocationSharing(false); // Go back to dashboard
+    } else if (error.code === error.TIMEOUT) {
+        if (state.usingHighAccuracy) {
+            showToast("GPS signal weak. Switching to cell/WiFi positioning...", "warning");
+            restartWatchWithLowAccuracy();
+        } else {
+            showToast("GPS signal request timed out.", "warning");
+        }
+    } else {
+        showToast("GPS Signal weak: " + error.message, "warning");
+    }
 }
 
 function publishLocationPacket(packet) {
@@ -748,7 +762,7 @@ function handleMqttIncomingMessage(topic, ciphertext) {
                         name: state.activeShare.name,
                         exp: state.activeShare.exp
                     });
-                }, { enableHighAccuracy: true });
+                }, { enableHighAccuracy: state.usingHighAccuracy, timeout: 5000 });
             }
         }
         return;
